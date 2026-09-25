@@ -1,3 +1,4 @@
 .pio
 .vscode
 zephyr/build
+*.code-workspace
