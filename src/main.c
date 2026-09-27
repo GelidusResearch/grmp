@@ -18,6 +18,7 @@
 #include <errno.h>
 #include <kernel.h>
 #include <stddef.h>
+#include <string.h>
 #include <sys/atomic.h>
 #include <sys/printk.h>
 #include <sys/util.h>
@@ -42,8 +43,10 @@
 #define CAL_MIN_BUTTON_PIN 7 /* press at the 0% end of travel */
 #define CAL_MAX_BUTTON_PIN 6 /* press at the 100% end of travel */
 
-#define HALL_PAIR_TIMEOUT_MS                                                   \
-  100 /* max time between paired edges; tune to top shaft speed */
+#define HALL_PAIR_TIMEOUT_MS 300 /* expire unmatched Hall edges */
+#define HALL_REVERSE_MIN_PAIR_MS 15 /* suppress very short opposite-direction glitches */
+#define ADV_BURST_DURATION_MS 250
+#define ADV_HEARTBEAT_INTERVAL_MS (10 * MSEC_PER_SEC)
 
 /* CR2032 has no external divider; sample VDD directly via the internal SAADC
  * input. */
@@ -117,11 +120,15 @@ static const struct bt_data sd[] = {
   BT_DATA(BT_DATA_NAME_COMPLETE, DEVICE_NAME, DEVICE_NAME_LEN),
 };
 
-static struct gpio_callback hall_irq_cb;
+static struct gpio_callback hall_a_irq_cb;
+static struct gpio_callback hall_b_irq_cb;
 static struct gpio_callback cal_button_irq_cb;
 static struct k_work adv_update_work;
+static struct k_work_delayable adv_stop_work;
+static struct k_work_delayable adv_heartbeat_work;
 static atomic_t position_count;
 static atomic_t last_direction = ATOMIC_INIT(DIRECTION_UNKNOWN);
+static atomic_t bluetooth_ready;
 /* Calibration end points set by the min/max buttons; percent is 0 until max >
  * min. */
 static atomic_t cal_min_position;
@@ -129,9 +136,11 @@ static atomic_t cal_max_position;
 static int16_t battery_sample_buffer;
 static uint16_t battery_mv;
 static int64_t last_battery_sample_ms = INT64_MIN;
+static struct rot_adv_packet last_adv_packet;
+static bool have_last_adv_packet;
+static bool adv_active;
 
-/* Only accessed from the (serialized) GPIO ISR context, so no locking needed.
- */
+/* Only accessed from the serialized GPIO ISR context. */
 static enum hall_event pending_event = HALL_EVENT_NONE;
 static int64_t pending_event_ms;
 
@@ -210,8 +219,46 @@ static void update_adv_packet(void) {
   adv_packet.direction = (uint8_t)atomic_get(&last_direction);
   adv_packet.battery_mv = battery_mv;
   adv_packet.button_state = read_button_state();
+}
+
+static void advertise_packet_burst(bool force) {
+  int err;
+
+  if (!atomic_get(&bluetooth_ready)) {
+    return;
+  }
+
+  update_adv_packet();
+  if (!force && have_last_adv_packet &&
+      memcmp(&adv_packet, &last_adv_packet, sizeof(adv_packet)) == 0) {
+    return;
+  }
+
+  if (adv_active) {
+    err = bt_le_adv_update_data(ad, ARRAY_SIZE(ad), sd, ARRAY_SIZE(sd));
+  } else {
+    err = bt_le_adv_start(BT_LE_ADV_NCONN, ad, ARRAY_SIZE(ad), sd,
+                          ARRAY_SIZE(sd));
+    if (err == 0) {
+      adv_active = true;
+    }
+  }
+
+  if (err) {
+    printk("Advertising update failed (err %d)\n", err);
+    return;
+  }
+
+  memcpy(&last_adv_packet, &adv_packet, sizeof(adv_packet));
+  have_last_adv_packet = true;
+  (void)k_work_reschedule(&adv_stop_work, K_MSEC(ADV_BURST_DURATION_MS));
+  (void)k_work_reschedule(&adv_heartbeat_work,
+                          K_MSEC(ADV_HEARTBEAT_INTERVAL_MS));
 #ifdef CONFIG_BT_DEBUG_LOG
-  printk("pos=%d (%u%%) dir=%u batt=%umV btn=0x%x\n", adv_packet.position_count,
+  printk("ADV_BURST t=%lldms reason=%s ret=%d pos=%d pct=%u dir=%u "
+         "batt=%umV btn=0x%x\n",
+         (long long)k_uptime_get(), force ? "heartbeat" : "change", err,
+         adv_packet.position_count,
          adv_packet.position_percent, adv_packet.direction,
          adv_packet.battery_mv, adv_packet.button_state);
 #endif
@@ -219,59 +266,103 @@ static void update_adv_packet(void) {
 
 static void adv_update_work_handler(struct k_work *work) {
   ARG_UNUSED(work);
+  advertise_packet_burst(false);
+}
 
-  update_adv_packet();
-  (void)bt_le_adv_update_data(ad, ARRAY_SIZE(ad), sd, ARRAY_SIZE(sd));
+static void adv_stop_work_handler(struct k_work *work) {
+  int err;
+
+  ARG_UNUSED(work);
+  if (!adv_active) {
+    return;
+  }
+
+  err = bt_le_adv_stop();
+  if (err == 0) {
+    adv_active = false;
+  } else {
+    printk("Advertising stop failed (err %d)\n", err);
+  }
+}
+
+static void adv_heartbeat_work_handler(struct k_work *work) {
+  ARG_UNUSED(work);
+  advertise_packet_burst(true);
 }
 
 /* Pairs a leading edge with the trailing edge from the other sensor to
  * determine direction. A/B order is: A then B -> CCW, B then A -> CW.
  */
 static void handle_hall_edge(enum hall_event event, int64_t now_ms) {
-  if (event == HALL_EVENT_A) {
-    if (pending_event == HALL_EVENT_B &&
-        (now_ms - pending_event_ms) <= HALL_PAIR_TIMEOUT_MS) {
-      atomic_dec(&position_count);
-#ifdef CONFIG_BT_DEBUG_LOG
-      printk("Position: %d Direction: CW\n", atomic_get(&position_count));
-#endif
-      atomic_set(&last_direction, DIRECTION_CW);
-      pending_event = HALL_EVENT_NONE;
-    } else {
-      pending_event = HALL_EVENT_A;
+  int64_t pending_age_ms = now_ms - pending_event_ms;
+  int64_t pair_delay_ms;
+  bool reject_fast_reverse;
+
+  if (pending_event != HALL_EVENT_NONE &&
+      pending_age_ms <= HALL_PAIR_TIMEOUT_MS) {
+    if (pending_event == event) {
       pending_event_ms = now_ms;
+      return;
     }
-  } else if (event == HALL_EVENT_B) {
-    if (pending_event == HALL_EVENT_A &&
-        (now_ms - pending_event_ms) <= HALL_PAIR_TIMEOUT_MS) {
-      atomic_inc(&position_count);
-      atomic_set(&last_direction, DIRECTION_CCW);
-#ifdef CONFIG_BT_DEBUG_LOG
-      printk("Position: %d Direction: CCW\n", atomic_get(&position_count));
-#endif
-      pending_event = HALL_EVENT_NONE;
+
+    pair_delay_ms = pending_age_ms;
+    if (pending_event == HALL_EVENT_B) {
+      reject_fast_reverse =
+          atomic_get(&last_direction) == DIRECTION_CCW &&
+          pair_delay_ms < HALL_REVERSE_MIN_PAIR_MS;
+      if (!reject_fast_reverse) {
+        atomic_inc(&position_count);
+        atomic_set(&last_direction, DIRECTION_CW);
+      }
     } else {
-      pending_event = HALL_EVENT_B;
-      pending_event_ms = now_ms;
+      reject_fast_reverse =
+          atomic_get(&last_direction) == DIRECTION_CW &&
+          pair_delay_ms < HALL_REVERSE_MIN_PAIR_MS;
+      if (!reject_fast_reverse) {
+        atomic_dec(&position_count);
+        atomic_set(&last_direction, DIRECTION_CCW);
+      }
     }
+
+    pending_event = HALL_EVENT_NONE;
+  } else {
+    pending_event = HALL_EVENT_NONE;
+    pending_event = event;
+    pending_event_ms = now_ms;
   }
 }
 
-static void hall_irq_handler(const struct device *dev, struct gpio_callback *cb,
+static void hall_irq_process(const struct device *dev, struct gpio_callback *cb,
                              uint32_t pins) {
-  int64_t now = k_uptime_get();
+  int64_t now_ms = k_uptime_get();
+  uint32_t hall_pins = pins & (BIT(hall_a.pin) | BIT(hall_b.pin));
 
   ARG_UNUSED(dev);
   ARG_UNUSED(cb);
 
-  if ((pins & BIT(hall_a.pin)) != 0U) {
-    handle_hall_edge(HALL_EVENT_A, now);
+  if (hall_pins == (BIT(hall_a.pin) | BIT(hall_b.pin))) {
+    pending_event = HALL_EVENT_NONE;
+    return;
   }
-  if ((pins & BIT(hall_b.pin)) != 0U) {
-    handle_hall_edge(HALL_EVENT_B, now);
+
+  if ((hall_pins & BIT(hall_a.pin)) != 0U) {
+    handle_hall_edge(HALL_EVENT_A, now_ms);
+  }
+  if ((hall_pins & BIT(hall_b.pin)) != 0U) {
+    handle_hall_edge(HALL_EVENT_B, now_ms);
   }
 
   k_work_submit(&adv_update_work);
+}
+
+static void hall_a_irq_handler(const struct device *dev,
+                               struct gpio_callback *cb, uint32_t pins) {
+  hall_irq_process(dev, cb, pins);
+}
+
+static void hall_b_irq_handler(const struct device *dev,
+                               struct gpio_callback *cb, uint32_t pins) {
+  hall_irq_process(dev, cb, pins);
 }
 
 static int configure_input(const struct gpio_dt_spec *spec) {
@@ -311,15 +402,10 @@ static void bt_ready(int err) {
   }
 
   printk("Bluetooth initialized\n");
-
-  err =
-      bt_le_adv_start(BT_LE_ADV_NCONN, ad, ARRAY_SIZE(ad), sd, ARRAY_SIZE(sd));
-  if (err) {
-    printk("Advertising failed to start (err %d)\n", err);
-    return;
-  }
+  atomic_set(&bluetooth_ready, 1);
+  k_work_submit(&adv_update_work);
 #ifdef CONFIG_BT_DEBUG_LOG
-  printk("Position sensor started, advertising as %s\n", DEVICE_NAME);
+  printk("Position sensor ready, advertising in bursts as %s\n", DEVICE_NAME);
 #endif
 }
 
@@ -365,12 +451,19 @@ void main(void) {
     return;
   }
 
-  gpio_init_callback(&hall_irq_cb, hall_irq_handler,
-                     BIT(hall_a.pin) | BIT(hall_b.pin));
+  gpio_init_callback(&hall_a_irq_cb, hall_a_irq_handler, BIT(hall_a.pin));
 
-  err = gpio_add_callback(hall_a.port, &hall_irq_cb);
+  err = gpio_add_callback(hall_a.port, &hall_a_irq_cb);
   if (err) {
-    printk("Failed to add HALL callback (err %d)\n", err);
+    printk("Failed to add HALL_A callback (err %d)\n", err);
+    return;
+  }
+
+  gpio_init_callback(&hall_b_irq_cb, hall_b_irq_handler, BIT(hall_b.pin));
+
+  err = gpio_add_callback(hall_b.port, &hall_b_irq_cb);
+  if (err) {
+    printk("Failed to add HALL_B callback (err %d)\n", err);
     return;
   }
 
@@ -410,6 +503,8 @@ void main(void) {
   }
 
   k_work_init(&adv_update_work, adv_update_work_handler);
+  k_work_init_delayable(&adv_stop_work, adv_stop_work_handler);
+  k_work_init_delayable(&adv_heartbeat_work, adv_heartbeat_work_handler);
 
   maybe_refresh_battery(true);
 

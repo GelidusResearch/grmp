@@ -48,7 +48,6 @@
             },
             "defines": [
                 "PLATFORMIO=60200",
-                "CONFIG_BT_DEBUG_LOG",
                 "BUILD_VERSION=zephyr-v20701",
                 "KERNEL",
                 "NRF52832_XXAA",
