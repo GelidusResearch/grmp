@@ -1,3 +1,4 @@
+
 /* main.c - Magnetic shaft position/direction sensor
  *
  * SPDX-License-Identifier: Apache-2.0
@@ -10,26 +11,27 @@
  * Each confirmed pair advances the position counter by one quarter turn.
  */
 
-#include <device.h>
-#include <devicetree.h>
-#include <drivers/adc.h>
-#include <drivers/gpio.h>
-#include <dt-bindings/gpio/gpio.h>
+#include <zephyr/device.h>
+#include <zephyr/devicetree.h>
+#include <zephyr/drivers/adc.h>
+#include <zephyr/drivers/gpio.h>
+#include <zephyr/dt-bindings/gpio/gpio.h>
 #include <errno.h>
-#include <kernel.h>
+#include <zephyr/kernel.h>
 #include <stddef.h>
 #include <string.h>
-#include <sys/atomic.h>
-#include <sys/printk.h>
-#include <sys/util.h>
+#include <zephyr/sys/atomic.h>
+#include <zephyr/sys/printk.h>
+#include <zephyr/sys/util.h>
 #include <zephyr/types.h>
 
 #if defined(CONFIG_ADC_CONFIGURABLE_INPUTS)
-#include <hal/nrf_saadc.h>
+#include <nrfx_saadc.h>
 #endif
+#include <hal/nrf_ficr.h>
 
-#include <bluetooth/bluetooth.h>
-#include <bluetooth/hci.h>
+#include <zephyr/bluetooth/bluetooth.h>
+#include <zephyr/bluetooth/hci.h>
 
 #define DEVICE_NAME CONFIG_BT_DEVICE_NAME
 #define DEVICE_NAME_LEN (sizeof(DEVICE_NAME) - 1)
@@ -46,11 +48,16 @@
 #define HALL_PAIR_TIMEOUT_MS 300 /* expire unmatched Hall edges */
 #define HALL_REVERSE_MIN_PAIR_MS 15 /* suppress very short opposite-direction glitches */
 #define ADV_BURST_DURATION_MS 250
-#define ADV_HEARTBEAT_INTERVAL_MS (10 * MSEC_PER_SEC)
+#define ADV_HEARTBEAT_INTERVAL_MS (5 * MSEC_PER_SEC)
 
 /* CR2032 has no external divider; sample VDD directly via the internal SAADC
  * input. */
 #define BATTERY_SAMPLE_INTERVAL_MS (5 * 60 * MSEC_PER_SEC)
+
+/* Measured offset correcting for internal reference/VDD-readback error;
+ * bench comparison against a multimeter showed the raw conversion reads
+ * ~75 mV low. */
+#define BATTERY_CAL_OFFSET_MV 100
 
 static const struct device *battery_adc = DEVICE_DT_GET(ADC_NODE);
 static const struct adc_channel_cfg battery_adc_cfg = {
@@ -59,7 +66,11 @@ static const struct adc_channel_cfg battery_adc_cfg = {
     .acquisition_time = ADC_ACQ_TIME(ADC_ACQ_TIME_MICROSECONDS, 40),
     .channel_id = 0,
 #if defined(CONFIG_ADC_CONFIGURABLE_INPUTS)
-    .input_positive = NRF_SAADC_INPUT_VDD,
+    /* NRFX_ANALOG_INTERNAL_VDD (nrfx_analog_common.h) replaces the old raw
+     * NRF_SAADC_INPUT_VDD register constant - the nrfx SAADC driver now maps
+     * ADC inputs through the generic nrfx_analog_input_t enum instead of
+     * chip register values, and only recognizes the new enum. */
+    .input_positive = NRFX_ANALOG_INTERNAL_VDD,
 #endif
 };
 
@@ -166,6 +177,7 @@ static int sample_battery_mv(uint16_t *measured_mv) {
     return ret;
   }
 
+  sample_mv += BATTERY_CAL_OFFSET_MV;
   *measured_mv = (uint16_t)CLAMP(sample_mv, 0, UINT16_MAX);
 
   return 0;
@@ -237,7 +249,11 @@ static void advertise_packet_burst(bool force) {
   if (adv_active) {
     err = bt_le_adv_update_data(ad, ARRAY_SIZE(ad), sd, ARRAY_SIZE(sd));
   } else {
-    err = bt_le_adv_start(BT_LE_ADV_NCONN, ad, ARRAY_SIZE(ad), sd,
+    /* BT_LE_ADV_OPT_USE_IDENTITY makes every burst restart advertise with
+     * the fixed FICR-derived identity address instead of a fresh
+     * non-resolvable private address, which is what bt_le_adv_start()
+     * would otherwise generate on every single restart. */
+    err = bt_le_adv_start(BT_LE_ADV_NCONN_IDENTITY, ad, ARRAY_SIZE(ad), sd,
                           ARRAY_SIZE(sd));
     if (err == 0) {
       adv_active = true;
@@ -245,7 +261,9 @@ static void advertise_packet_burst(bool force) {
   }
 
   if (err) {
+#ifdef CONFIG_BT_DEBUG_LOG
     printk("Advertising update failed (err %d)\n", err);
+#endif
     return;
   }
 
@@ -281,7 +299,9 @@ static void adv_stop_work_handler(struct k_work *work) {
   if (err == 0) {
     adv_active = false;
   } else {
+#ifdef CONFIG_BT_DEBUG_LOG
     printk("Advertising stop failed (err %d)\n", err);
+#endif
   }
 }
 
@@ -395,9 +415,35 @@ static void cal_button_irq_handler(const struct device *dev,
   k_work_submit(&adv_update_work);
 }
 
+/* Build a fixed BLE identity (random static) address from Nordic's
+ * factory-programmed, chip-unique FICR DEVICEADDR registers, and register it
+ * as the default identity before bt_enable(). Without this, bt_enable()
+ * would generate a brand-new random static address from the CSPRNG on every
+ * boot (this project has no settings/flash subsystem to persist one across
+ * power cycles), so the advertised address would change every power-up.
+ */
+static int configure_static_ble_identity(void) {
+  bt_addr_le_t addr = {.type = BT_ADDR_LE_RANDOM};
+  uint32_t addr_lo = nrf_ficr_deviceaddr_get(NRF_FICR, 0);
+  uint32_t addr_hi = nrf_ficr_deviceaddr_get(NRF_FICR, 1);
+
+  addr.a.val[0] = (uint8_t)(addr_lo & 0xFF);
+  addr.a.val[1] = (uint8_t)((addr_lo >> 8) & 0xFF);
+  addr.a.val[2] = (uint8_t)((addr_lo >> 16) & 0xFF);
+  addr.a.val[3] = (uint8_t)((addr_lo >> 24) & 0xFF);
+  addr.a.val[4] = (uint8_t)(addr_hi & 0xFF);
+  addr.a.val[5] = (uint8_t)((addr_hi >> 8) & 0xFF);
+  /* Random static address: the two most significant bits must be 1. */
+  addr.a.val[5] |= 0xC0;
+
+  return bt_id_create(&addr, NULL);
+}
+
 static void bt_ready(int err) {
   if (err) {
+#ifdef CONFIG_BT_DEBUG_LOG
     printk("Bluetooth init failed (err %d)\n", err);
+#endif
     return;
   }
 
@@ -409,7 +455,7 @@ static void bt_ready(int err) {
 #endif
 }
 
-void main(void) {
+int main(void) {
   int err;
 
 #ifdef CONFIG_BT_DEBUG_LOG
@@ -417,80 +463,104 @@ void main(void) {
 #endif
 
   if (!device_is_ready(battery_adc)) {
+#ifdef CONFIG_BT_DEBUG_LOG
     printk("Battery ADC not ready\n");
-    return;
+#endif
+    return -1;
   }
 
   err = adc_channel_setup(battery_adc, &battery_adc_cfg);
   if (err) {
+#ifdef CONFIG_BT_DEBUG_LOG
     printk("Failed to configure battery ADC (err %d)\n", err);
-    return;
+#endif
+    return -1;
   }
 
   err = configure_input(&hall_a);
   if (err) {
+#ifdef CONFIG_BT_DEBUG_LOG
     printk("Failed to configure HALL_A (err %d)\n", err);
-    return;
+#endif
+    return -1;
   }
 
   err = configure_input(&hall_b);
   if (err) {
+#ifdef CONFIG_BT_DEBUG_LOG
     printk("Failed to configure HALL_B (err %d)\n", err);
-    return;
+#endif
+    return -1;
   }
 
   err = gpio_pin_interrupt_configure_dt(&hall_a, GPIO_INT_EDGE_TO_ACTIVE);
   if (err) {
+#ifdef CONFIG_BT_DEBUG_LOG
     printk("Failed to configure HALL_A interrupt (err %d)\n", err);
-    return;
+#endif
+    return -1;
   }
 
   err = gpio_pin_interrupt_configure_dt(&hall_b, GPIO_INT_EDGE_TO_ACTIVE);
   if (err) {
+#ifdef CONFIG_BT_DEBUG_LOG
     printk("Failed to configure HALL_B interrupt (err %d)\n", err);
-    return;
+#endif
+    return -1;
   }
 
   gpio_init_callback(&hall_a_irq_cb, hall_a_irq_handler, BIT(hall_a.pin));
 
   err = gpio_add_callback(hall_a.port, &hall_a_irq_cb);
   if (err) {
+#ifdef CONFIG_BT_DEBUG_LOG
     printk("Failed to add HALL_A callback (err %d)\n", err);
-    return;
+#endif
+    return -1;
   }
 
   gpio_init_callback(&hall_b_irq_cb, hall_b_irq_handler, BIT(hall_b.pin));
 
   err = gpio_add_callback(hall_b.port, &hall_b_irq_cb);
   if (err) {
+#ifdef CONFIG_BT_DEBUG_LOG
     printk("Failed to add HALL_B callback (err %d)\n", err);
-    return;
+#endif
+    return -1;
   }
 
   err = configure_input(&cal_min_button);
   if (err) {
+#ifdef CONFIG_BT_DEBUG_LOG
     printk("Failed to configure CAL_MIN button (err %d)\n", err);
-    return;
+#endif
+    return -1;
   }
 
   err = configure_input(&cal_max_button);
   if (err) {
+#ifdef CONFIG_BT_DEBUG_LOG
     printk("Failed to configure CAL_MAX button (err %d)\n", err);
-    return;
+#endif
+    return -1;
   }
 
   err =
       gpio_pin_interrupt_configure_dt(&cal_min_button, GPIO_INT_EDGE_TO_ACTIVE);
   if (err) {
+#ifdef CONFIG_BT_DEBUG_LOG
     printk("Failed to configure CAL_MIN interrupt (err %d)\n", err);
-    return;
+#endif
+    return -1;
   }
 
   err =
       gpio_pin_interrupt_configure_dt(&cal_max_button, GPIO_INT_EDGE_TO_ACTIVE);
   if (err) {
+#ifdef CONFIG_BT_DEBUG_LOG
     printk("Failed to configure CAL_MAX interrupt (err %d)\n", err);
-    return;
+#endif
+    return -1;
   }
 
   gpio_init_callback(&cal_button_irq_cb, cal_button_irq_handler,
@@ -498,8 +568,10 @@ void main(void) {
 
   err = gpio_add_callback(cal_min_button.port, &cal_button_irq_cb);
   if (err) {
+#ifdef CONFIG_BT_DEBUG_LOG
     printk("Failed to add calibration button callback (err %d)\n", err);
-    return;
+#endif
+    return -1;
   }
 
   k_work_init(&adv_update_work, adv_update_work_handler);
@@ -508,9 +580,19 @@ void main(void) {
 
   maybe_refresh_battery(true);
 
+  err = configure_static_ble_identity();
+  if (err < 0) {
+#ifdef CONFIG_BT_DEBUG_LOG
+    printk("Failed to set static BLE identity (err %d)\n", err);
+    return -1;
+#endif
+  }
+
   /* Initialize the Bluetooth Subsystem */
   err = bt_enable(bt_ready);
   if (err) {
+#ifdef CONFIG_BT_DEBUG_LOG
     printk("Bluetooth init failed (err %d)\n", err);
+#endif
   }
 }

@@ -1,3 +1,52 @@
 &adc {
 	status = "okay";
 };
+
+/* This app only drives P0.06/07/08/11 (cal buttons + Hall sensors) and the
+ * internal VDD ADC channel. Everything below is inherited from the stock
+ * makerdiary nrf52832_mdk board .dts and is unused on this custom board, so
+ * disable it rather than leaving it enabled by default.
+ *
+ * &uart0 matters most: CONFIG_SERIAL/CONFIG_UART_NRFX are pulled in by the
+ * board defconfig, so with status "okay" Zephyr initializes and enables the
+ * legacy UART0 peripheral at boot even though the console runs over RTT
+ * (CONFIG_UART_CONSOLE=n) and nothing else uses it - an enabled-but-idle
+ * nRF52 UART draws continuous current for no benefit. Its pinctrl also
+ * claims P0.07 (CTS) for the UART, the same physical pin main.c configures
+ * as CAL_MIN_BUTTON_PIN.
+ *
+ * &i2c0/&i2c1/&pwm0 and the leds/pwmleds/buttons nodes are currently inert
+ * (CONFIG_I2C, CONFIG_PWM, CONFIG_LED and CONFIG_INPUT are all unset, so no
+ * driver touches those pins), but are disabled here too so they can't start
+ * drawing power or fighting over pins if one of those Kconfig options is
+ * ever turned on later.
+ */
+&uart0 {
+	status = "disabled";
+};
+
+&i2c0 {
+	status = "disabled";
+};
+
+&i2c1 {
+	status = "disabled";
+};
+
+&pwm0 {
+	status = "disabled";
+};
+
+/ {
+	leds {
+		status = "disabled";
+	};
+
+	pwmleds {
+		status = "disabled";
+	};
+
+	buttons {
+		status = "disabled";
+	};
+};
