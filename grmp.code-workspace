@@ -1,0 +1,15 @@
+{
+	"folders": [
+		{
+			"path": "."
+		}
+	],
+	"settings": {
+		"chat.tools.terminal.autoApprove": {
+			"/^& \"C:\\\\Users\\\\mlaspina\\.LASPINA\\\\\\.platformio\\\\penv\\\\Scripts\\\\platformio\\.exe\" run --environment nrf52832_dk$/": {
+				"approve": true,
+				"matchCommandLine": true
+			}
+		}
+	}
+}

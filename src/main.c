@@ -5,20 +5,22 @@
  *
  * Shaft carries 4 magnets spaced 90 degrees apart. Two hall-effect sensors
  * (P0.08 = HALL_A, P0.11 = HALL_B) are mounted so that each passing magnet
- * triggers them in sequence rather than at the same instant. If HALL_A
- * fires and HALL_B follows within HALL_PAIR_TIMEOUT_MS, the shaft is
- * turning counter-clockwise; if HALL_B fires first, it is clockwise.
- * Each confirmed pair advances the position counter by one quarter turn.
+ * triggers them in sequence rather than at the same instant. A valid pair of
+ * edges (20..100 ms apart) is one count; the sensor that fires first gives the
+ * direction.
  */
 
 #include <zephyr/device.h>
 #include <zephyr/devicetree.h>
 #include <zephyr/drivers/adc.h>
+#include <zephyr/drivers/flash.h>
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/dt-bindings/gpio/gpio.h>
 #include <errno.h>
 #include <zephyr/kernel.h>
 #include <stddef.h>
+#include <zephyr/storage/flash_map.h>
+#include <zephyr/kvss/nvs.h>
 #include <string.h>
 #include <zephyr/sys/atomic.h>
 #include <zephyr/sys/printk.h>
@@ -45,10 +47,15 @@
 #define CAL_MIN_BUTTON_PIN 7 /* press at the 0% end of travel */
 #define CAL_MAX_BUTTON_PIN 6 /* press at the 100% end of travel */
 
-#define HALL_PAIR_TIMEOUT_MS 300 /* expire unmatched Hall edges */
-#define HALL_REVERSE_MIN_PAIR_MS 15 /* suppress very short opposite-direction glitches */
-#define ADV_BURST_DURATION_MS 250
-#define ADV_HEARTBEAT_INTERVAL_MS (5 * MSEC_PER_SEC)
+/* One magnet pass fires both Hall sensors; a valid count needs the two edges
+ * 20..100 ms apart. */
+#define HALL_PAIR_MIN_MS 5
+#define HALL_PAIR_MAX_MS 200
+#define ADV_BURST_DURATION_MS 500
+#define ADV_HEARTBEAT_INTERVAL_MS (20 * MSEC_PER_SEC)
+#define POSITION_SAVE_DELAY_MS (60 * MSEC_PER_SEC) /* save position every 60 seconds to prevent rapid fire saves */
+#define POSITION_STATE_NVS_ID 1U
+#define POSITION_STATE_MAGIC 0x47524D50U
 
 /* CR2032 has no external divider; sample VDD directly via the internal SAADC
  * input. */
@@ -57,7 +64,7 @@
 /* Measured offset correcting for internal reference/VDD-readback error;
  * bench comparison against a multimeter showed the raw conversion reads
  * ~75 mV low. */
-#define BATTERY_CAL_OFFSET_MV 100
+#define BATTERY_CAL_OFFSET_MV 300 /* Diode voltage drop compensation */
 
 static const struct device *battery_adc = DEVICE_DT_GET(ADC_NODE);
 static const struct adc_channel_cfg battery_adc_cfg = {
@@ -77,12 +84,12 @@ static const struct adc_channel_cfg battery_adc_cfg = {
 static const struct gpio_dt_spec hall_a = {
     .port = DEVICE_DT_GET(GPIO0_NODE),
     .pin = HALL_A_PIN,
-    .dt_flags = (GPIO_PULL_DOWN | GPIO_ACTIVE_HIGH),
+    .dt_flags = (GPIO_ACTIVE_LOW),
 };
 static const struct gpio_dt_spec hall_b = {
     .port = DEVICE_DT_GET(GPIO0_NODE),
     .pin = HALL_B_PIN,
-    .dt_flags = (GPIO_PULL_DOWN | GPIO_ACTIVE_HIGH),
+    .dt_flags = (GPIO_ACTIVE_LOW),
 };
 static const struct gpio_dt_spec cal_min_button = {
     .port = DEVICE_DT_GET(GPIO0_NODE),
@@ -116,6 +123,13 @@ struct __packed rot_adv_packet {
   uint8_t button_state;
 };
 
+struct position_state {
+  uint32_t magic;
+  int32_t position_count;
+  int32_t cal_min_position;
+  int32_t cal_max_position;
+};
+
 static struct rot_adv_packet adv_packet = {
     .company_id = 0x5AFE,
 };
@@ -137,6 +151,8 @@ static struct gpio_callback cal_button_irq_cb;
 static struct k_work adv_update_work;
 static struct k_work_delayable adv_stop_work;
 static struct k_work_delayable adv_heartbeat_work;
+static struct k_work_delayable position_save_work;
+static struct nvs_fs position_nvs;
 static atomic_t position_count;
 static atomic_t last_direction = ATOMIC_INIT(DIRECTION_UNKNOWN);
 static atomic_t bluetooth_ready;
@@ -154,6 +170,82 @@ static bool adv_active;
 /* Only accessed from the serialized GPIO ISR context. */
 static enum hall_event pending_event = HALL_EVENT_NONE;
 static int64_t pending_event_ms;
+
+static int init_position_storage(void) {
+  struct flash_pages_info page_info;
+  int err;
+
+  position_nvs.flash_device = PARTITION_DEVICE(storage_partition);
+  if (!device_is_ready(position_nvs.flash_device)) {
+    return -ENODEV;
+  }
+
+  position_nvs.offset = PARTITION_OFFSET(storage_partition);
+  err = flash_get_page_info_by_offs(position_nvs.flash_device,
+                                    position_nvs.offset, &page_info);
+  if (err) {
+    return err;
+  }
+
+  position_nvs.sector_size = page_info.size;
+  if ((PARTITION_SIZE(storage_partition) % page_info.size) != 0U) {
+    return -EINVAL;
+  }
+  position_nvs.sector_count =
+      PARTITION_SIZE(storage_partition) / page_info.size;
+  if (position_nvs.sector_count < 2U) {
+    return -EINVAL;
+  }
+
+  return nvs_mount(&position_nvs);
+}
+
+static int restore_position_state(void) {
+  struct position_state state;
+  ssize_t read_size;
+
+  read_size = nvs_read(&position_nvs, POSITION_STATE_NVS_ID, &state,
+                       sizeof(state));
+  if (read_size == -ENOENT) {
+    return 0;
+  }
+  if (read_size < 0) {
+    return (int)read_size;
+  }
+  if ((size_t)read_size != sizeof(state) ||
+      state.magic != POSITION_STATE_MAGIC) {
+    return -EBADMSG;
+  }
+
+  atomic_set(&position_count, state.position_count);
+  atomic_set(&cal_min_position, state.cal_min_position);
+  atomic_set(&cal_max_position, state.cal_max_position);
+  return 0;
+}
+
+static void position_save_work_handler(struct k_work *work) {
+  struct position_state state = {
+      .magic = POSITION_STATE_MAGIC,
+      .position_count = atomic_get(&position_count),
+      .cal_min_position = atomic_get(&cal_min_position),
+      .cal_max_position = atomic_get(&cal_max_position),
+  };
+  ssize_t written;
+
+  ARG_UNUSED(work);
+
+  written = nvs_write(&position_nvs, POSITION_STATE_NVS_ID, &state,
+                      sizeof(state));
+  if (written < 0 ||
+      (written != 0 && (size_t)written != sizeof(state))) {
+    printk("Position state save failed (err %d)\n", (int)written);
+  }
+}
+
+static void schedule_position_save(void) {
+  (void)k_work_reschedule(&position_save_work,
+                          K_MSEC(POSITION_SAVE_DELAY_MS));
+}
 
 static int sample_battery_mv(uint16_t *measured_mv) {
   int ret;
@@ -310,79 +402,53 @@ static void adv_heartbeat_work_handler(struct k_work *work) {
   advertise_packet_burst(true);
 }
 
-/* Pairs a leading edge with the trailing edge from the other sensor to
- * determine direction. A/B order is: A then B -> CCW, B then A -> CW.
+/* A magnet pass fires both sensors. One valid count is one edge from each
+ * sensor arriving HALL_PAIR_MIN_MS..HALL_PAIR_MAX_MS apart. The first edge is
+ * held as pending, and the sensor that fired first sets direction (B first ->
+ * clockwise, A first -> counter-clockwise). Out-of-window edges are dropped.
  */
-static void handle_hall_edge(enum hall_event event, int64_t now_ms) {
-  int64_t pending_age_ms = now_ms - pending_event_ms;
-  int64_t pair_delay_ms;
-  bool reject_fast_reverse;
+static void hall_edge(enum hall_event event, int64_t now_ms) {
+  int64_t delta_ms;
 
-  if (pending_event != HALL_EVENT_NONE &&
-      pending_age_ms <= HALL_PAIR_TIMEOUT_MS) {
-    if (pending_event == event) {
-      pending_event_ms = now_ms;
-      return;
-    }
+  if (pending_event == HALL_EVENT_NONE || pending_event == event) {
+    pending_event = event;
+    pending_event_ms = now_ms;
+    return;
+  }
 
-    pair_delay_ms = pending_age_ms;
+  delta_ms = now_ms - pending_event_ms;
+  if (delta_ms >= HALL_PAIR_MIN_MS && delta_ms <= HALL_PAIR_MAX_MS) {
     if (pending_event == HALL_EVENT_B) {
-      reject_fast_reverse =
-          atomic_get(&last_direction) == DIRECTION_CCW &&
-          pair_delay_ms < HALL_REVERSE_MIN_PAIR_MS;
-      if (!reject_fast_reverse) {
-        atomic_inc(&position_count);
-        atomic_set(&last_direction, DIRECTION_CW);
-      }
+      atomic_inc(&position_count);
+      atomic_set(&last_direction, DIRECTION_CW);
     } else {
-      reject_fast_reverse =
-          atomic_get(&last_direction) == DIRECTION_CW &&
-          pair_delay_ms < HALL_REVERSE_MIN_PAIR_MS;
-      if (!reject_fast_reverse) {
-        atomic_dec(&position_count);
-        atomic_set(&last_direction, DIRECTION_CCW);
-      }
+      atomic_dec(&position_count);
+      atomic_set(&last_direction, DIRECTION_CCW);
     }
-
+    schedule_position_save();
     pending_event = HALL_EVENT_NONE;
   } else {
-    pending_event = HALL_EVENT_NONE;
     pending_event = event;
     pending_event_ms = now_ms;
   }
 }
 
-static void hall_irq_process(const struct device *dev, struct gpio_callback *cb,
-                             uint32_t pins) {
-  int64_t now_ms = k_uptime_get();
-  uint32_t hall_pins = pins & (BIT(hall_a.pin) | BIT(hall_b.pin));
-
-  ARG_UNUSED(dev);
-  ARG_UNUSED(cb);
-
-  if (hall_pins == (BIT(hall_a.pin) | BIT(hall_b.pin))) {
-    pending_event = HALL_EVENT_NONE;
-    return;
-  }
-
-  if ((hall_pins & BIT(hall_a.pin)) != 0U) {
-    handle_hall_edge(HALL_EVENT_A, now_ms);
-  }
-  if ((hall_pins & BIT(hall_b.pin)) != 0U) {
-    handle_hall_edge(HALL_EVENT_B, now_ms);
-  }
-
-  k_work_submit(&adv_update_work);
-}
-
 static void hall_a_irq_handler(const struct device *dev,
                                struct gpio_callback *cb, uint32_t pins) {
-  hall_irq_process(dev, cb, pins);
+  ARG_UNUSED(dev);
+  ARG_UNUSED(cb);
+  ARG_UNUSED(pins);
+  hall_edge(HALL_EVENT_A, k_uptime_get());
+  k_work_submit(&adv_update_work);
 }
 
 static void hall_b_irq_handler(const struct device *dev,
                                struct gpio_callback *cb, uint32_t pins) {
-  hall_irq_process(dev, cb, pins);
+  ARG_UNUSED(dev);
+  ARG_UNUSED(cb);
+  ARG_UNUSED(pins);
+  hall_edge(HALL_EVENT_B, k_uptime_get());
+  k_work_submit(&adv_update_work);
 }
 
 static int configure_input(const struct gpio_dt_spec *spec) {
@@ -397,6 +463,7 @@ static int configure_input(const struct gpio_dt_spec *spec) {
 static void cal_button_irq_handler(const struct device *dev,
                                    struct gpio_callback *cb, uint32_t pins) {
   int32_t position = atomic_get(&position_count);
+  bool state_changed = false;
 
   ARG_UNUSED(dev);
   ARG_UNUSED(cb);
@@ -404,14 +471,21 @@ static void cal_button_irq_handler(const struct device *dev,
   if ((pins & BIT(cal_min_button.pin)) != 0U) {
     /* Reset all calibration positions to 0 when the minimum button is pressed. This is an init state for calibration.
        The cal max position button should be triggered to set the open position count. */
+    state_changed = atomic_get(&position_count) != 0 ||
+                    atomic_get(&cal_min_position) != 0 ||
+                    atomic_get(&cal_max_position) != 0;
     atomic_set(&position_count, 0);
     atomic_set(&cal_min_position, 0);
     atomic_set(&cal_max_position, 0);
   }
   if ((pins & BIT(cal_max_button.pin)) != 0U) {
+    state_changed |= atomic_get(&cal_max_position) != position;
     atomic_set(&cal_max_position, position);
   }
 
+  if (state_changed) {
+    schedule_position_save();
+  }
   k_work_submit(&adv_update_work);
 }
 
@@ -436,7 +510,16 @@ static int configure_static_ble_identity(void) {
   /* Random static address: the two most significant bits must be 1. */
   addr.a.val[5] |= 0xC0;
 
-  return bt_id_create(&addr, NULL);
+  int id = bt_id_create(&addr, NULL);
+  if (id < 0) {
+    return id;
+  }
+
+  char addr_str[BT_ADDR_LE_STR_LEN];
+  bt_addr_le_to_str(&addr, addr_str, sizeof(addr_str));
+  printk("BLE MAC address: %s\n", addr_str);
+
+  return id;
 }
 
 static void bt_ready(int err) {
@@ -461,6 +544,23 @@ int main(void) {
 #ifdef CONFIG_BT_DEBUG_LOG
   printk("Starting Magnetic Position Sensor\n");
 #endif
+
+  err = init_position_storage();
+  if (err) {
+    printk("Position storage initialization failed (err %d)\n", err);
+    return err;
+  }
+
+  err = restore_position_state();
+  if (err) {
+    printk("Position state restore failed (err %d)\n", err);
+    return err;
+  }
+
+  k_work_init(&adv_update_work, adv_update_work_handler);
+  k_work_init_delayable(&adv_stop_work, adv_stop_work_handler);
+  k_work_init_delayable(&adv_heartbeat_work, adv_heartbeat_work_handler);
+  k_work_init_delayable(&position_save_work, position_save_work_handler);
 
   if (!device_is_ready(battery_adc)) {
 #ifdef CONFIG_BT_DEBUG_LOG
@@ -573,10 +673,6 @@ int main(void) {
 #endif
     return -1;
   }
-
-  k_work_init(&adv_update_work, adv_update_work_handler);
-  k_work_init_delayable(&adv_stop_work, adv_stop_work_handler);
-  k_work_init_delayable(&adv_heartbeat_work, adv_heartbeat_work_handler);
 
   maybe_refresh_battery(true);
 
