@@ -14,11 +14,14 @@
 #include <zephyr/device.h>
 #include <zephyr/devicetree.h>
 #include <zephyr/drivers/adc.h>
+#include <zephyr/drivers/flash.h>
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/dt-bindings/gpio/gpio.h>
 #include <errno.h>
 #include <zephyr/kernel.h>
 #include <stddef.h>
+#include <zephyr/storage/flash_map.h>
+#include <zephyr/kvss/nvs.h>
 #include <string.h>
 #include <zephyr/sys/atomic.h>
 #include <zephyr/sys/printk.h>
@@ -49,6 +52,9 @@
 #define HALL_REVERSE_MIN_PAIR_MS 15 /* suppress very short opposite-direction glitches */
 #define ADV_BURST_DURATION_MS 250
 #define ADV_HEARTBEAT_INTERVAL_MS (5 * MSEC_PER_SEC)
+#define POSITION_SAVE_DELAY_MS (60 * MSEC_PER_SEC)
+#define POSITION_STATE_NVS_ID 1U
+#define POSITION_STATE_MAGIC 0x47524D50U
 
 /* CR2032 has no external divider; sample VDD directly via the internal SAADC
  * input. */
@@ -77,12 +83,12 @@ static const struct adc_channel_cfg battery_adc_cfg = {
 static const struct gpio_dt_spec hall_a = {
     .port = DEVICE_DT_GET(GPIO0_NODE),
     .pin = HALL_A_PIN,
-    .dt_flags = (GPIO_PULL_DOWN | GPIO_ACTIVE_HIGH),
+    .dt_flags = (GPIO_ACTIVE_LOW),
 };
 static const struct gpio_dt_spec hall_b = {
     .port = DEVICE_DT_GET(GPIO0_NODE),
     .pin = HALL_B_PIN,
-    .dt_flags = (GPIO_PULL_DOWN | GPIO_ACTIVE_HIGH),
+    .dt_flags = (GPIO_ACTIVE_LOW),
 };
 static const struct gpio_dt_spec cal_min_button = {
     .port = DEVICE_DT_GET(GPIO0_NODE),
@@ -116,6 +122,13 @@ struct __packed rot_adv_packet {
   uint8_t button_state;
 };
 
+struct position_state {
+  uint32_t magic;
+  int32_t position_count;
+  int32_t cal_min_position;
+  int32_t cal_max_position;
+};
+
 static struct rot_adv_packet adv_packet = {
     .company_id = 0x5AFE,
 };
@@ -137,6 +150,8 @@ static struct gpio_callback cal_button_irq_cb;
 static struct k_work adv_update_work;
 static struct k_work_delayable adv_stop_work;
 static struct k_work_delayable adv_heartbeat_work;
+static struct k_work_delayable position_save_work;
+static struct nvs_fs position_nvs;
 static atomic_t position_count;
 static atomic_t last_direction = ATOMIC_INIT(DIRECTION_UNKNOWN);
 static atomic_t bluetooth_ready;
@@ -154,6 +169,82 @@ static bool adv_active;
 /* Only accessed from the serialized GPIO ISR context. */
 static enum hall_event pending_event = HALL_EVENT_NONE;
 static int64_t pending_event_ms;
+
+static int init_position_storage(void) {
+  struct flash_pages_info page_info;
+  int err;
+
+  position_nvs.flash_device = PARTITION_DEVICE(storage_partition);
+  if (!device_is_ready(position_nvs.flash_device)) {
+    return -ENODEV;
+  }
+
+  position_nvs.offset = PARTITION_OFFSET(storage_partition);
+  err = flash_get_page_info_by_offs(position_nvs.flash_device,
+                                    position_nvs.offset, &page_info);
+  if (err) {
+    return err;
+  }
+
+  position_nvs.sector_size = page_info.size;
+  if ((PARTITION_SIZE(storage_partition) % page_info.size) != 0U) {
+    return -EINVAL;
+  }
+  position_nvs.sector_count =
+      PARTITION_SIZE(storage_partition) / page_info.size;
+  if (position_nvs.sector_count < 2U) {
+    return -EINVAL;
+  }
+
+  return nvs_mount(&position_nvs);
+}
+
+static int restore_position_state(void) {
+  struct position_state state;
+  ssize_t read_size;
+
+  read_size = nvs_read(&position_nvs, POSITION_STATE_NVS_ID, &state,
+                       sizeof(state));
+  if (read_size == -ENOENT) {
+    return 0;
+  }
+  if (read_size < 0) {
+    return (int)read_size;
+  }
+  if ((size_t)read_size != sizeof(state) ||
+      state.magic != POSITION_STATE_MAGIC) {
+    return -EBADMSG;
+  }
+
+  atomic_set(&position_count, state.position_count);
+  atomic_set(&cal_min_position, state.cal_min_position);
+  atomic_set(&cal_max_position, state.cal_max_position);
+  return 0;
+}
+
+static void position_save_work_handler(struct k_work *work) {
+  struct position_state state = {
+      .magic = POSITION_STATE_MAGIC,
+      .position_count = atomic_get(&position_count),
+      .cal_min_position = atomic_get(&cal_min_position),
+      .cal_max_position = atomic_get(&cal_max_position),
+  };
+  ssize_t written;
+
+  ARG_UNUSED(work);
+
+  written = nvs_write(&position_nvs, POSITION_STATE_NVS_ID, &state,
+                      sizeof(state));
+  if (written < 0 ||
+      (written != 0 && (size_t)written != sizeof(state))) {
+    printk("Position state save failed (err %d)\n", (int)written);
+  }
+}
+
+static void schedule_position_save(void) {
+  (void)k_work_reschedule(&position_save_work,
+                          K_MSEC(POSITION_SAVE_DELAY_MS));
+}
 
 static int sample_battery_mv(uint16_t *measured_mv) {
   int ret;
@@ -333,6 +424,7 @@ static void handle_hall_edge(enum hall_event event, int64_t now_ms) {
       if (!reject_fast_reverse) {
         atomic_inc(&position_count);
         atomic_set(&last_direction, DIRECTION_CW);
+        schedule_position_save();
       }
     } else {
       reject_fast_reverse =
@@ -341,6 +433,7 @@ static void handle_hall_edge(enum hall_event event, int64_t now_ms) {
       if (!reject_fast_reverse) {
         atomic_dec(&position_count);
         atomic_set(&last_direction, DIRECTION_CCW);
+        schedule_position_save();
       }
     }
 
@@ -397,6 +490,7 @@ static int configure_input(const struct gpio_dt_spec *spec) {
 static void cal_button_irq_handler(const struct device *dev,
                                    struct gpio_callback *cb, uint32_t pins) {
   int32_t position = atomic_get(&position_count);
+  bool state_changed = false;
 
   ARG_UNUSED(dev);
   ARG_UNUSED(cb);
@@ -404,14 +498,21 @@ static void cal_button_irq_handler(const struct device *dev,
   if ((pins & BIT(cal_min_button.pin)) != 0U) {
     /* Reset all calibration positions to 0 when the minimum button is pressed. This is an init state for calibration.
        The cal max position button should be triggered to set the open position count. */
+    state_changed = atomic_get(&position_count) != 0 ||
+                    atomic_get(&cal_min_position) != 0 ||
+                    atomic_get(&cal_max_position) != 0;
     atomic_set(&position_count, 0);
     atomic_set(&cal_min_position, 0);
     atomic_set(&cal_max_position, 0);
   }
   if ((pins & BIT(cal_max_button.pin)) != 0U) {
+    state_changed |= atomic_get(&cal_max_position) != position;
     atomic_set(&cal_max_position, position);
   }
 
+  if (state_changed) {
+    schedule_position_save();
+  }
   k_work_submit(&adv_update_work);
 }
 
@@ -461,6 +562,23 @@ int main(void) {
 #ifdef CONFIG_BT_DEBUG_LOG
   printk("Starting Magnetic Position Sensor\n");
 #endif
+
+  err = init_position_storage();
+  if (err) {
+    printk("Position storage initialization failed (err %d)\n", err);
+    return err;
+  }
+
+  err = restore_position_state();
+  if (err) {
+    printk("Position state restore failed (err %d)\n", err);
+    return err;
+  }
+
+  k_work_init(&adv_update_work, adv_update_work_handler);
+  k_work_init_delayable(&adv_stop_work, adv_stop_work_handler);
+  k_work_init_delayable(&adv_heartbeat_work, adv_heartbeat_work_handler);
+  k_work_init_delayable(&position_save_work, position_save_work_handler);
 
   if (!device_is_ready(battery_adc)) {
 #ifdef CONFIG_BT_DEBUG_LOG
@@ -573,10 +691,6 @@ int main(void) {
 #endif
     return -1;
   }
-
-  k_work_init(&adv_update_work, adv_update_work_handler);
-  k_work_init_delayable(&adv_stop_work, adv_stop_work_handler);
-  k_work_init_delayable(&adv_heartbeat_work, adv_heartbeat_work_handler);
 
   maybe_refresh_battery(true);
 
