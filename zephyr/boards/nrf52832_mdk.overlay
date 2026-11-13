@@ -2,7 +2,7 @@
 	status = "okay";
 };
 
-/* This app only drives P0.06/07/08/11 (cal buttons + Hall sensors) and the
+/* This app only drives P0.06/07/08/11/12 (cal buttons + Hall sensors) and the
  * internal VDD ADC channel. Everything below is inherited from the stock
  * makerdiary nrf52832_mdk board .dts and is unused on this custom board, so
  * disable it rather than leaving it enabled by default.

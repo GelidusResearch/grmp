@@ -5,9 +5,10 @@
  *
  * Shaft carries 4 magnets spaced 90 degrees apart. Two hall-effect sensors
  * (P0.08 = HALL_A, P0.11 = HALL_B) are mounted so that each passing magnet
- * triggers them in sequence rather than at the same instant. A valid pair of
- * edges (20..100 ms apart) is one count; the sensor that fires first gives the
- * direction.
+ * triggers them in sequence rather than at the same instant. Each pair of
+ * edges from the two sensors is one count; the sensor that fires first gives
+ * the direction. A pulse is held until its second sensor fires, so pauses in
+ * shaft movement do not lose counts.
  */
 
 #include <zephyr/device.h>
@@ -46,16 +47,17 @@
 
 #define CAL_MIN_BUTTON_PIN 7 /* press at the 0% end of travel */
 #define CAL_MAX_BUTTON_PIN 6 /* press at the 100% end of travel */
+#define CAL_DIR_BUTTON_PIN 12 /* Direction select button */
 
-/* One magnet pass fires both Hall sensors; a valid count needs the two edges
- * 20..100 ms apart. */
+/* One magnet pass fires both Hall sensors. A pending edge is kept until the
+ * other sensor fires, however long the shaft pauses in between. */
 #define HALL_PAIR_MIN_MS 5
-#define HALL_PAIR_MAX_MS 200
 #define ADV_BURST_DURATION_MS 500
-#define ADV_HEARTBEAT_INTERVAL_MS (20 * MSEC_PER_SEC)
+#define ADV_HEARTBEAT_INTERVAL_MS (30 * MSEC_PER_SEC)
 #define POSITION_SAVE_DELAY_MS (60 * MSEC_PER_SEC) /* save position every 60 seconds to prevent rapid fire saves */
 #define POSITION_STATE_NVS_ID 1U
 #define POSITION_STATE_MAGIC 0x47524D50U
+#define CAL_DIR_DEBOUNCE_MS 200
 
 /* CR2032 has no external divider; sample VDD directly via the internal SAADC
  * input. */
@@ -101,6 +103,11 @@ static const struct gpio_dt_spec cal_max_button = {
     .pin = CAL_MAX_BUTTON_PIN,
     .dt_flags = (GPIO_PULL_DOWN | GPIO_ACTIVE_HIGH),
 };
+static const struct gpio_dt_spec cal_dir_button = {
+    .port = DEVICE_DT_GET(GPIO0_NODE),
+    .pin = CAL_DIR_BUTTON_PIN,
+    .dt_flags = (GPIO_PULL_DOWN | GPIO_ACTIVE_HIGH),
+};
 
 enum shaft_direction {
   DIRECTION_UNKNOWN = 0,
@@ -124,6 +131,15 @@ struct __packed rot_adv_packet {
 };
 
 struct position_state {
+  uint32_t magic;
+  int32_t position_count;
+  int32_t cal_min_position;
+  int32_t cal_max_position;
+  int32_t cal_dir_position;
+};
+
+/* Layout of records saved before cal_dir_position was added. */
+struct position_state_v1 {
   uint32_t magic;
   int32_t position_count;
   int32_t cal_min_position;
@@ -156,10 +172,11 @@ static struct nvs_fs position_nvs;
 static atomic_t position_count;
 static atomic_t last_direction = ATOMIC_INIT(DIRECTION_UNKNOWN);
 static atomic_t bluetooth_ready;
-/* Calibration end points set by the min/max buttons; percent is 0 until max >
- * min. */
 static atomic_t cal_min_position;
 static atomic_t cal_max_position;
+/* 0 = normal pulse direction, 1 = inverted (toggled by the CAL_DIR button). */
+static atomic_t cal_dir_position;
+static int64_t last_cal_dir_toggle_ms = -(int64_t)CAL_DIR_DEBOUNCE_MS;
 static int16_t battery_sample_buffer;
 static uint16_t battery_mv;
 static int64_t last_battery_sample_ms = INT64_MIN;
@@ -202,6 +219,7 @@ static int init_position_storage(void) {
 
 static int restore_position_state(void) {
   struct position_state state;
+  struct position_state_v1 legacy;
   ssize_t read_size;
 
   read_size = nvs_read(&position_nvs, POSITION_STATE_NVS_ID, &state,
@@ -212,14 +230,32 @@ static int restore_position_state(void) {
   if (read_size < 0) {
     return (int)read_size;
   }
-  if ((size_t)read_size != sizeof(state) ||
-      state.magic != POSITION_STATE_MAGIC) {
+
+  /* Records written before cal_dir_position was added keep their calibration;
+   * the pulse direction starts in the normal orientation. */
+  if ((size_t)read_size == sizeof(legacy)) {
+    read_size = nvs_read(&position_nvs, POSITION_STATE_NVS_ID, &legacy,
+                         sizeof(legacy));
+    if (read_size < 0) {
+      return (int)read_size;
+    }
+    if ((size_t)read_size != sizeof(legacy) ||
+        legacy.magic != POSITION_STATE_MAGIC) {
+      return -EBADMSG;
+    }
+    state.position_count = legacy.position_count;
+    state.cal_min_position = legacy.cal_min_position;
+    state.cal_max_position = legacy.cal_max_position;
+    state.cal_dir_position = 0;
+  } else if ((size_t)read_size != sizeof(state) ||
+             state.magic != POSITION_STATE_MAGIC) {
     return -EBADMSG;
   }
 
   atomic_set(&position_count, state.position_count);
   atomic_set(&cal_min_position, state.cal_min_position);
   atomic_set(&cal_max_position, state.cal_max_position);
+  atomic_set(&cal_dir_position, state.cal_dir_position);
   return 0;
 }
 
@@ -229,6 +265,7 @@ static void position_save_work_handler(struct k_work *work) {
       .position_count = atomic_get(&position_count),
       .cal_min_position = atomic_get(&cal_min_position),
       .cal_max_position = atomic_get(&cal_max_position),
+      .cal_dir_position = atomic_get(&cal_dir_position),
   };
   ssize_t written;
 
@@ -268,6 +305,10 @@ static int sample_battery_mv(uint16_t *measured_mv) {
   if (ret < 0) {
     return ret;
   }
+
+#ifdef CONFIG_BT_DEBUG_LOG
+  printk("Battery raw=%d pre_offset=%dmV\n", battery_sample_buffer, (int)sample_mv);
+#endif
 
   sample_mv += BATTERY_CAL_OFFSET_MV;
   *measured_mv = (uint16_t)CLAMP(sample_mv, 0, UINT16_MAX);
@@ -309,6 +350,7 @@ static uint8_t read_button_state(void) {
 
   state |= (gpio_pin_get_dt(&cal_min_button) > 0) ? BIT(0) : 0U;
   state |= (gpio_pin_get_dt(&cal_max_button) > 0) ? BIT(1) : 0U;
+  state |= (gpio_pin_get_dt(&cal_dir_button) > 0) ? BIT(2) : 0U;
 
   return state;
 }
@@ -402,10 +444,11 @@ static void adv_heartbeat_work_handler(struct k_work *work) {
   advertise_packet_burst(true);
 }
 
-/* A magnet pass fires both sensors. One valid count is one edge from each
- * sensor arriving HALL_PAIR_MIN_MS..HALL_PAIR_MAX_MS apart. The first edge is
- * held as pending, and the sensor that fired first sets direction (B first ->
- * clockwise, A first -> counter-clockwise). Out-of-window edges are dropped.
+/* A magnet pass fires both sensors. The first edge is held as pending until
+ * the other sensor fires, however long that takes, and the pair is one count.
+ * The sensor that fired first sets direction (B first -> clockwise, A first ->
+ * counter-clockwise). An edge within HALL_PAIR_MIN_MS of the pending edge from
+ * the other sensor is treated as noise and replaces the pending edge.
  */
 static void hall_edge(enum hall_event event, int64_t now_ms) {
   int64_t delta_ms;
@@ -417,8 +460,10 @@ static void hall_edge(enum hall_event event, int64_t now_ms) {
   }
 
   delta_ms = now_ms - pending_event_ms;
-  if (delta_ms >= HALL_PAIR_MIN_MS && delta_ms <= HALL_PAIR_MAX_MS) {
-    if (pending_event == HALL_EVENT_B) {
+  if (delta_ms >= HALL_PAIR_MIN_MS) {
+    bool inverted = atomic_get(&cal_dir_position) != 0;
+
+    if ((pending_event == HALL_EVENT_B) != inverted) {
       atomic_inc(&position_count);
       atomic_set(&last_direction, DIRECTION_CW);
     } else {
@@ -426,6 +471,11 @@ static void hall_edge(enum hall_event event, int64_t now_ms) {
       atomic_set(&last_direction, DIRECTION_CCW);
     }
     schedule_position_save();
+#ifdef CONFIG_BT_DEBUG_LOG
+    printk("Pulse t=%lldms dir=%s pos=%d\n", (long long)now_ms,
+           atomic_get(&last_direction) == DIRECTION_CW ? "CW" : "CCW",
+           (int)atomic_get(&position_count));
+#endif
     pending_event = HALL_EVENT_NONE;
   } else {
     pending_event = event;
@@ -438,6 +488,9 @@ static void hall_a_irq_handler(const struct device *dev,
   ARG_UNUSED(dev);
   ARG_UNUSED(cb);
   ARG_UNUSED(pins);
+#ifdef CONFIG_BT_DEBUG_LOG
+  printk("HALL_A edge t=%lldms\n", (long long)k_uptime_get());
+#endif
   hall_edge(HALL_EVENT_A, k_uptime_get());
   k_work_submit(&adv_update_work);
 }
@@ -447,6 +500,9 @@ static void hall_b_irq_handler(const struct device *dev,
   ARG_UNUSED(dev);
   ARG_UNUSED(cb);
   ARG_UNUSED(pins);
+#ifdef CONFIG_BT_DEBUG_LOG
+  printk("HALL_B edge t=%lldms\n", (long long)k_uptime_get());
+#endif
   hall_edge(HALL_EVENT_B, k_uptime_get());
   k_work_submit(&adv_update_work);
 }
@@ -481,6 +537,19 @@ static void cal_button_irq_handler(const struct device *dev,
   if ((pins & BIT(cal_max_button.pin)) != 0U) {
     state_changed |= atomic_get(&cal_max_position) != position;
     atomic_set(&cal_max_position, position);
+  }
+  if ((pins & BIT(cal_dir_button.pin)) != 0U) {
+    int64_t now = k_uptime_get();
+
+    if ((now - last_cal_dir_toggle_ms) >= CAL_DIR_DEBOUNCE_MS) {
+      atomic_set(&cal_dir_position, !atomic_get(&cal_dir_position));
+      last_cal_dir_toggle_ms = now;
+      state_changed = true;
+#ifdef CONFIG_BT_DEBUG_LOG
+      printk("Pulse direction inverted=%d\n",
+             (int)atomic_get(&cal_dir_position));
+#endif
+    }
   }
 
   if (state_changed) {
@@ -663,8 +732,26 @@ int main(void) {
     return -1;
   }
 
+  err = configure_input(&cal_dir_button);
+  if (err) {
+#ifdef CONFIG_BT_DEBUG_LOG
+    printk("Failed to configure CAL_DIR button (err %d)\n", err);
+#endif
+    return -1;
+  }
+
+  err =
+      gpio_pin_interrupt_configure_dt(&cal_dir_button, GPIO_INT_EDGE_TO_ACTIVE);
+  if (err) {
+#ifdef CONFIG_BT_DEBUG_LOG
+    printk("Failed to configure CAL_DIR interrupt (err %d)\n", err);
+#endif
+    return -1;
+  }
+
   gpio_init_callback(&cal_button_irq_cb, cal_button_irq_handler,
-                     BIT(cal_min_button.pin) | BIT(cal_max_button.pin));
+                     BIT(cal_min_button.pin) | BIT(cal_max_button.pin) |
+                         BIT(cal_dir_button.pin));
 
   err = gpio_add_callback(cal_min_button.port, &cal_button_irq_cb);
   if (err) {
