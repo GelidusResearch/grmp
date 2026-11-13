@@ -138,14 +138,6 @@ struct position_state {
   int32_t cal_dir_position;
 };
 
-/* Layout of records saved before cal_dir_position was added. */
-struct position_state_v1 {
-  uint32_t magic;
-  int32_t position_count;
-  int32_t cal_min_position;
-  int32_t cal_max_position;
-};
-
 static struct rot_adv_packet adv_packet = {
     .company_id = 0x5AFE,
 };
@@ -219,7 +211,6 @@ static int init_position_storage(void) {
 
 static int restore_position_state(void) {
   struct position_state state;
-  struct position_state_v1 legacy;
   ssize_t read_size;
 
   read_size = nvs_read(&position_nvs, POSITION_STATE_NVS_ID, &state,
@@ -230,25 +221,8 @@ static int restore_position_state(void) {
   if (read_size < 0) {
     return (int)read_size;
   }
-
-  /* Records written before cal_dir_position was added keep their calibration;
-   * the pulse direction starts in the normal orientation. */
-  if ((size_t)read_size == sizeof(legacy)) {
-    read_size = nvs_read(&position_nvs, POSITION_STATE_NVS_ID, &legacy,
-                         sizeof(legacy));
-    if (read_size < 0) {
-      return (int)read_size;
-    }
-    if ((size_t)read_size != sizeof(legacy) ||
-        legacy.magic != POSITION_STATE_MAGIC) {
-      return -EBADMSG;
-    }
-    state.position_count = legacy.position_count;
-    state.cal_min_position = legacy.cal_min_position;
-    state.cal_max_position = legacy.cal_max_position;
-    state.cal_dir_position = 0;
-  } else if ((size_t)read_size != sizeof(state) ||
-             state.magic != POSITION_STATE_MAGIC) {
+  if ((size_t)read_size != sizeof(state) ||
+      state.magic != POSITION_STATE_MAGIC) {
     return -EBADMSG;
   }
 
@@ -275,7 +249,9 @@ static void position_save_work_handler(struct k_work *work) {
                       sizeof(state));
   if (written < 0 ||
       (written != 0 && (size_t)written != sizeof(state))) {
+#ifdef CONFIG_BT_DEBUG_LOG
     printk("Position state save failed (err %d)\n", (int)written);
+#endif
   }
 }
 
@@ -586,7 +562,9 @@ static int configure_static_ble_identity(void) {
 
   char addr_str[BT_ADDR_LE_STR_LEN];
   bt_addr_le_to_str(&addr, addr_str, sizeof(addr_str));
+#ifdef CONFIG_BT_DEBUG_LOG
   printk("BLE MAC address: %s\n", addr_str);
+#endif
 
   return id;
 }
@@ -599,7 +577,9 @@ static void bt_ready(int err) {
     return;
   }
 
+#ifdef CONFIG_BT_DEBUG_LOG
   printk("Bluetooth initialized\n");
+#endif
   atomic_set(&bluetooth_ready, 1);
   k_work_submit(&adv_update_work);
 #ifdef CONFIG_BT_DEBUG_LOG
@@ -616,13 +596,17 @@ int main(void) {
 
   err = init_position_storage();
   if (err) {
+#ifdef CONFIG_BT_DEBUG_LOG
     printk("Position storage initialization failed (err %d)\n", err);
+#endif
     return err;
   }
 
   err = restore_position_state();
   if (err) {
+#ifdef CONFIG_BT_DEBUG_LOG
     printk("Position state restore failed (err %d)\n", err);
+#endif
     return err;
   }
 
